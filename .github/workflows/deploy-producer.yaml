@@ -18,7 +18,7 @@ env:
   IMAGE_NAME: wikimedia-lakehouse-kafka-producer
   WORKER_POOL_NAME: wikimedia-lakehouse-kafka-producer
   DOCKERFILE: ingestion/producer/Dockerfile
-  KAFKA_BOOTSTRAP: bootstrap.wikimedia-lakehouse-kafka.us-central1.managedkafka.lab-experiments-514316.cloud.goog:9092
+  KAFKA_BOOTSTRAP: bootstrap-q-f3vwmc9slirwmoy56bewqjl.a6424b16f.us-central1.managedkafka.s.cloud.goog:9092
   KAFKA_TOPIC: recentchange
   CHECKPOINT_BUCKET: lab-experiments-514316-wikimedia-lakehouse
   WIKIMEDIA_USER_AGENT: wikimedia-lakehouse-kafka/0.1 (https://github.com/anvaldes/wikimedia-lakehouse-kafka)
@@ -65,6 +65,6 @@ jobs:
             --instances=1 \
             --network=default \
             --subnet=default \
-            --vpc-egress=private-ranges-only \
+            --vpc-egress=all-traffic \
             --set-env-vars="KAFKA_BOOTSTRAP=${KAFKA_BOOTSTRAP},KAFKA_TOPIC=${KAFKA_TOPIC},CHECKPOINT_BUCKET=${CHECKPOINT_BUCKET},WIKIMEDIA_USER_AGENT=${WIKIMEDIA_USER_AGENT}" \
             --quiet

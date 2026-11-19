@@ -18,9 +18,9 @@ BUCKET = os.environ.get("CHECKPOINT_BUCKET", "")
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "checkpoints/producer/last_event_id.txt")
 USER_AGENT = os.environ.get("WIKIMEDIA_USER_AGENT", "")
 CHECKPOINT_EVERY_S = 30
-MAX_FAILURES = 5
+MAX_FAILURES = 8
 
-state = {"last_id": None, "failed": 0, "failures": 0, "stop": False}
+state = {"last_id": None, "failed": 0, "failures": 0, "published": 0, "stop": False}
 
 provider, meter = init_metrics("wikimedia-producer")
 events_received = meter.create_counter("events_received")
@@ -45,6 +45,7 @@ def checkpoint(producer):
         raise RuntimeError(f"Publish failed: {state['failed']} failed, {pending} pending")
     if state["last_id"]:
         save_checkpoint(BUCKET, CHECKPOINT_PATH, state["last_id"])
+        print(f"✔ Checkpoint saved, published so far: {state['published']}")
 
 
 def handle_sigterm(signum, frame):
@@ -65,6 +66,7 @@ def run_stream(producer):
             continue
         publish(producer, TOPIC, event, on_delivery)
         state["last_id"] = event_id
+        state["published"] += 1
         events_published.add(1)
         event_lag.record(get_lag(event))
         if time.time() - last_checkpoint > CHECKPOINT_EVERY_S:
