@@ -16,7 +16,7 @@ env:
   BUILD_CONTEXT: ingestion/producer
 
 jobs:
-  deploy:
+  deploy-producer:
     runs-on: ubuntu-latest
     permissions:
       contents: read
