@@ -3,6 +3,9 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'ingestion/producer/**'
+      - '.github/workflows/deploy-producer.yaml'
 
 env:
   PROJECT_ID: lab-experiments-514316
