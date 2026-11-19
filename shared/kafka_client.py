@@ -35,10 +35,10 @@ def create_producer(bootstrap):
     })
 
 
-def publish(producer, topic, event, on_delivery):
+def publish(producer, topic, key, value, on_delivery):
     try:
-        producer.produce(topic, key=event.get("wiki", ""), value=json.dumps(event), on_delivery=on_delivery)
+        producer.produce(topic, key=key, value=value, on_delivery=on_delivery)
     except BufferError:
         producer.poll(1)
-        producer.produce(topic, key=event.get("wiki", ""), value=json.dumps(event), on_delivery=on_delivery)
+        producer.produce(topic, key=key, value=value, on_delivery=on_delivery)
     producer.poll(0)

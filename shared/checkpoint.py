@@ -1,10 +1,9 @@
-from google.cloud import storage
+from shared.gcs import upload_text, download_text
 
 
 def load_checkpoint(bucket, path):
-    blob = storage.Client().bucket(bucket).blob(path)
-    return blob.download_as_text() if blob.exists() else None
+    return download_text(bucket, path)
 
 
 def save_checkpoint(bucket, path, event_id):
-    storage.Client().bucket(bucket).blob(path).upload_from_string(event_id)
+    upload_text(bucket, path, event_id)

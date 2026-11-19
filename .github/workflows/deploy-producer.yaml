@@ -20,7 +20,8 @@ env:
   DOCKERFILE: ingestion/producer/Dockerfile
   KAFKA_BOOTSTRAP: bootstrap-q-f3vwmc9slirwmoy56bewqjl.a6424b16f.us-central1.managedkafka.s.cloud.goog:9092
   KAFKA_TOPIC: recentchange
-  CHECKPOINT_BUCKET: lab-experiments-514316-wikimedia-lakehouse
+  KAFKA_DLQ_TOPIC: recentchange.dlq
+  BUCKET: wikimedia-lakehouse-kafka
   WIKIMEDIA_USER_AGENT: wikimedia-lakehouse-kafka/0.1 (https://github.com/anvaldes/wikimedia-lakehouse-kafka)
 
 jobs:
@@ -66,5 +67,5 @@ jobs:
             --network=default \
             --subnet=default \
             --vpc-egress=all-traffic \
-            --set-env-vars="KAFKA_BOOTSTRAP=${KAFKA_BOOTSTRAP},KAFKA_TOPIC=${KAFKA_TOPIC},CHECKPOINT_BUCKET=${CHECKPOINT_BUCKET},WIKIMEDIA_USER_AGENT=${WIKIMEDIA_USER_AGENT}" \
+            --set-env-vars="KAFKA_BOOTSTRAP=${KAFKA_BOOTSTRAP},KAFKA_TOPIC=${KAFKA_TOPIC},KAFKA_DLQ_TOPIC=${KAFKA_DLQ_TOPIC},BUCKET=${BUCKET},WIKIMEDIA_USER_AGENT=${WIKIMEDIA_USER_AGENT}" \
             --quiet

@@ -1,4 +1,3 @@
-import json
 import requests
 
 STREAM_URL = "https://stream.wikimedia.org/v2/stream/recentchange"
@@ -11,15 +10,8 @@ def open_stream(user_agent, last_event_id=None):
     return requests.get(STREAM_URL, headers=headers, stream=True, timeout=(10, 60))
 
 
-def parse_event(data_lines):
-    try:
-        return json.loads("\n".join(data_lines))
-    except json.JSONDecodeError:
-        print("⚠ Skipping malformed event")
-        return None
-
-
 def read_events(response):
+    """Yields (event_id, raw_data) for each SSE message. Parsing/validation happens downstream."""
     event_id, data_lines = None, []
     for line in response.iter_lines(decode_unicode=True):
         if line.startswith("id:"):
@@ -27,9 +19,7 @@ def read_events(response):
         elif line.startswith("data:"):
             data_lines.append(line[5:].strip())
         elif line == "" and data_lines:
-            event = parse_event(data_lines)
-            if event:
-                yield event_id, event
+            yield event_id, "\n".join(data_lines)
             event_id, data_lines = None, []
 
 
