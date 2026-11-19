@@ -2,18 +2,14 @@ FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PORT=8080 \
-    GOOGLE_CLOUD_PROJECT=dm-data-aiml
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc libffi-dev libssl-dev curl && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    GOOGLE_CLOUD_PROJECT=lab-experiments-514316
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY ingestion/producer/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY shared/ ./shared/
+COPY ingestion/producer/ .
 
-CMD ["gunicorn", "--timeout", "0", "--bind", ":8080", "main:app"]
+CMD ["python", "main.py"]

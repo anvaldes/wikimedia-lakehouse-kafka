@@ -5,6 +5,7 @@ on:
       - main
     paths:
       - 'ingestion/producer/**'
+      - 'shared/**'
       - '.github/workflows/deploy-producer.yaml'
 
 env:
@@ -15,8 +16,12 @@ env:
   SERVICE_ACCOUNT: portfolio-runtime@lab-experiments-514316.iam.gserviceaccount.com
   PROJECT_NUMBER: '115741533268'
   IMAGE_NAME: wikimedia-lakehouse-kafka-producer
-  SERVICE_NAME: wikimedia-lakehouse-kafka-producer
-  BUILD_CONTEXT: ingestion/producer
+  WORKER_POOL_NAME: wikimedia-lakehouse-kafka-producer
+  DOCKERFILE: ingestion/producer/Dockerfile
+  KAFKA_BOOTSTRAP: bootstrap.wikimedia-lakehouse-kafka.us-central1.managedkafka.lab-experiments-514316.cloud.goog:9092
+  KAFKA_TOPIC: recentchange
+  CHECKPOINT_BUCKET: lab-experiments-514316-wikimedia-lakehouse
+  WIKIMEDIA_USER_AGENT: wikimedia-lakehouse-kafka/0.1 (https://github.com/anvaldes/wikimedia-lakehouse-kafka)
 
 jobs:
   deploy-producer:
@@ -41,19 +46,25 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker "$REGISTRY" --quiet
 
-      # 1. Build image
+      # 1. Build image (context = repo root, so shared/ is included)
       - name: Build Docker image
-        run: docker build --platform linux/amd64 -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" "$BUILD_CONTEXT"
+        run: docker build --platform linux/amd64 -f "$DOCKERFILE" -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
 
       # 2. Push image to Artifact Registry
       - name: Push Docker image
         run: docker push --all-tags "$IMAGE"
 
-      # 3. Deploy to Cloud Run
-      - name: Deploy to Cloud Run
+      # 3. Deploy to Cloud Run worker pool
+      - name: Deploy to Cloud Run worker pool
         run: |
-          gcloud run deploy "$SERVICE_NAME" \
+          gcloud run worker-pools deploy "$WORKER_POOL_NAME" \
             --image="$IMAGE:${{ github.sha }}" \
             --region="$REGION" \
             --project="$PROJECT_ID" \
-            --service-account="$SERVICE_ACCOUNT"
+            --service-account="$SERVICE_ACCOUNT" \
+            --instances=1 \
+            --network=default \
+            --subnet=default \
+            --vpc-egress=private-ranges-only \
+            --set-env-vars="KAFKA_BOOTSTRAP=${KAFKA_BOOTSTRAP},KAFKA_TOPIC=${KAFKA_TOPIC},CHECKPOINT_BUCKET=${CHECKPOINT_BUCKET},WIKIMEDIA_USER_AGENT=${WIKIMEDIA_USER_AGENT}" \
+            --quiet

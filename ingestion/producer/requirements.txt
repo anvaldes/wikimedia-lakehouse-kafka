@@ -1,3 +1,6 @@
-flask==2.2.5
-gunicorn==20.1.0
-google-cloud-storage==2.16.0
+requests==2.34.2
+confluent-kafka==2.16.2
+google-auth==2.40.3
+google-cloud-storage==3.17.1
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-gcp-monitoring==1.15.0a0
