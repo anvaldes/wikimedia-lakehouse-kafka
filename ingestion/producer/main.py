@@ -95,6 +95,7 @@ def run_stream(producer):
         elif error:
             send_to_dlq(producer, event_id, raw, error)
         else:
+            event["ingested_at"] = datetime.now(timezone.utc).isoformat()
             publish(producer, TOPIC, event["wiki"], json.dumps(event), on_delivery)
             state["published"] += 1
             events_published.add(1)
