@@ -1,0 +1,18 @@
+# Secrets and credentials: never commit these
+.env
+.env.*
+*.json
+*.pem
+*.p12
+!.vscode/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editors
+.DS_Store
+.idea/

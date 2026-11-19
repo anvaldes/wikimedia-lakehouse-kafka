@@ -1,0 +1,56 @@
+name: Deploy producer
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PROJECT_ID: lab-experiments-514316
+  REGION: us-central1
+  REGISTRY: us-central1-docker.pkg.dev
+  AR_REPO: wikimedia-lakehouse-kafka
+  SERVICE_ACCOUNT: portfolio-runtime@lab-experiments-514316.iam.gserviceaccount.com
+  PROJECT_NUMBER: '115741533268'
+  IMAGE_NAME: wikimedia-lakehouse-kafka-producer
+  SERVICE_NAME: wikimedia-lakehouse-kafka-producer
+  BUILD_CONTEXT: ingestion/producer
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set full image path
+        run: echo "IMAGE=${REGISTRY}/${PROJECT_ID}/${AR_REPO}/${IMAGE_NAME}" >> "$GITHUB_ENV"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "$REGISTRY" --quiet
+
+      # 1. Build image
+      - name: Build Docker image
+        run: docker build --platform linux/amd64 -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" "$BUILD_CONTEXT"
+
+      # 2. Push image to Artifact Registry
+      - name: Push Docker image
+        run: docker push --all-tags "$IMAGE"
+
+      # 3. Deploy to Cloud Run
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "$SERVICE_NAME" \
+            --image="$IMAGE:${{ github.sha }}" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --service-account="$SERVICE_ACCOUNT"
