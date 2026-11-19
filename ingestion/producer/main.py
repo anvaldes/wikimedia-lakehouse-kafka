@@ -90,10 +90,10 @@ def run_stream(producer):
         state["failures"] = 0
         events_received.add(1)
         event, error = parse_and_validate(raw)
-        if error:
-            send_to_dlq(producer, event_id, raw, error)
-        elif is_canary(event):
+        if event is not None and is_canary(event):
             events_dropped.add(1, {"reason": "canary"})
+        elif error:
+            send_to_dlq(producer, event_id, raw, error)
         else:
             publish(producer, TOPIC, event["wiki"], json.dumps(event), on_delivery)
             state["published"] += 1
