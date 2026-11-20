@@ -28,7 +28,8 @@ PACKAGES+=",org.apache.iceberg:iceberg-spark-runtime-3.5_${SCALA_VERSION}:${ICEB
 PACKAGES+=",org.apache.iceberg:iceberg-gcp-bundle:${ICEBERG_VERSION}"
 PACKAGES+=",com.google.cloud.hosted.kafka:managed-kafka-auth-login-handler:${KAFKA_AUTH_VERSION}"
 
-BATCH_ID="kafka-to-bronze-${MODE}-$(printf '%04d%02d%02d%02d' "$YEAR" "$MONTH" "$DAY" "$HOUR")-$(date +%s)"
+# 10# forces base 10: bash would read "08" / "09" as invalid octal numbers
+BATCH_ID="kafka-to-bronze-${MODE}-$(printf '%04d%02d%02d%02d' $((10#$YEAR)) $((10#$MONTH)) $((10#$DAY)) $((10#$HOUR)))-$(date +%s)"
 
 # ^#^ switches gcloud's list delimiter to '#' because spark.jars.packages contains commas.
 gcloud dataproc batches submit pyspark "gs://${BUCKET}/code/jobs/kafka_to_bronze.py" \
