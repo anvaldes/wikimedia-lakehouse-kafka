@@ -11,6 +11,9 @@ if [[ "$MODE" == "continuous" ]]; then TTL=7d; else TTL=4h; fi
 # Cost cap: fixed at the minimum of 2 executors, never scales up (~27 events/s doesn't need more).
 SPARK_PROPERTIES="spark.executor.instances=2#spark.dynamicAllocation.minExecutors=2#spark.dynamicAllocation.maxExecutors=2"
 
+# The Kafka auth handler pulls the Confluent Schema Registry client (not on Maven Central, and unused here).
+SPARK_PROPERTIES+="#spark.jars.excludes=io.confluent:kafka-schema-registry-client"
+
 PROJECT_ID=lab-experiments-514316
 REGION=us-central1
 BUCKET=wikimedia-lakehouse-kafka

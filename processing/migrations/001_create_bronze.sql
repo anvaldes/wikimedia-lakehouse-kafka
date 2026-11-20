@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.bronze.recentchange (
     raw_json                  STRING    COMMENT 'Kafka message value, unmodified',
     kafka_topic               STRING    COMMENT 'Source topic',
     kafka_partition           INT       COMMENT 'Source partition',
-    kafka_offset              BIGINT    COMMENT 'Source offset; (topic, partition, offset) is the row key',
+    kafka_offset              BIGINT    COMMENT 'Source offset. (topic, partition, offset) is the row key',
     event_ts                  TIMESTAMP COMMENT 'meta.dt, or timestamp_kafka if meta.dt cannot be parsed',
     ingested_at               TIMESTAMP COMMENT 'When the producer received the event (null for old messages)',
     timestamp_kafka           TIMESTAMP COMMENT 'Kafka record timestamp (LogAppendTime: broker write time)',
