@@ -5,8 +5,11 @@ set -euo pipefail
 
 YEAR=$1 MONTH=$2 DAY=$3 HOUR=$4 MODE=${5:-stream}
 
-# Max run time: continuous runs until the TTL kills it (then it must be resubmitted); the others are a safety cap.
-if [[ "$MODE" == "continuous" ]]; then TTL=14d; else TTL=4h; fi
+# Max run time: continuous runs until the TTL stops it (one week); the others are a safety cap.
+if [[ "$MODE" == "continuous" ]]; then TTL=7d; else TTL=4h; fi
+
+# Cost cap: fixed at the minimum of 2 executors, never scales up (~27 events/s doesn't need more).
+SPARK_PROPERTIES="spark.executor.instances=2#spark.dynamicAllocation.minExecutors=2#spark.dynamicAllocation.maxExecutors=2"
 
 PROJECT_ID=lab-experiments-514316
 REGION=us-central1
@@ -37,5 +40,5 @@ gcloud dataproc batches submit pyspark "gs://${BUCKET}/code/jobs/kafka_to_bronze
   --subnet=default \
   --service-account="$SERVICE_ACCOUNT" \
   --py-files="gs://${BUCKET}/code/processing.zip" \
-  --properties="^#^spark.jars.packages=${PACKAGES}" \
+  --properties="^#^spark.jars.packages=${PACKAGES}#${SPARK_PROPERTIES}" \
   -- --year "$YEAR" --month "$MONTH" --day "$DAY" --hour "$HOUR" --mode "$MODE"
