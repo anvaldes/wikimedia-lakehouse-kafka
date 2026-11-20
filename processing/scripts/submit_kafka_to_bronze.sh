@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Submits kafka_to_bronze as a Serverless for Apache Spark (Dataproc serverless) batch.
+# Usage: processing/scripts/submit_kafka_to_bronze.sh YEAR MONTH DAY HOUR [stream|backfill]
+set -euo pipefail
+
+YEAR=$1 MONTH=$2 DAY=$3 HOUR=$4 MODE=${5:-stream}
+
+PROJECT_ID=lab-experiments-514316
+REGION=us-central1
+BUCKET=wikimedia-lakehouse-kafka
+SERVICE_ACCOUNT=portfolio-runtime@lab-experiments-514316.iam.gserviceaccount.com
+
+# Versions must match the Dataproc runtime (Spark 3.5 / Scala 2.13 on runtime 2.2): check the job's first log line.
+RUNTIME_VERSION=2.2
+SCALA_VERSION=2.13
+SPARK_VERSION=3.5.1
+ICEBERG_VERSION=1.10.0
+KAFKA_AUTH_VERSION=1.0.6
+
+PACKAGES="org.apache.spark:spark-sql-kafka-0-10_${SCALA_VERSION}:${SPARK_VERSION}"
+PACKAGES+=",org.apache.iceberg:iceberg-spark-runtime-3.5_${SCALA_VERSION}:${ICEBERG_VERSION}"
+PACKAGES+=",org.apache.iceberg:iceberg-gcp-bundle:${ICEBERG_VERSION}"
+PACKAGES+=",com.google.cloud.hosted.kafka:managed-kafka-auth-login-handler:${KAFKA_AUTH_VERSION}"
+
+BATCH_ID="kafka-to-bronze-${MODE}-$(printf '%04d%02d%02d%02d' "$YEAR" "$MONTH" "$DAY" "$HOUR")-$(date +%s)"
+
+# ^#^ switches gcloud's list delimiter to '#' because spark.jars.packages contains commas.
+gcloud dataproc batches submit pyspark "gs://${BUCKET}/code/jobs/kafka_to_bronze.py" \
+  --project="$PROJECT_ID" \
+  --region="$REGION" \
+  --batch="$BATCH_ID" \
+  --version="$RUNTIME_VERSION" \
+  --subnet=default \
+  --service-account="$SERVICE_ACCOUNT" \
+  --py-files="gs://${BUCKET}/code/processing.zip" \
+  --properties="^#^spark.jars.packages=${PACKAGES}" \
+  -- --year "$YEAR" --month "$MONTH" --day "$DAY" --hour "$HOUR" --mode "$MODE"

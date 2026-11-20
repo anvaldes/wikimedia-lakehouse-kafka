@@ -1,0 +1,39 @@
+name: Upload jobs
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'processing/**'
+      - 'shared/**'
+      - '.github/workflows/upload-jobs.yaml'
+
+env:
+  BUCKET: wikimedia-lakehouse-kafka
+
+jobs:
+  upload-jobs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      # 1. Package processing/ + shared/ for --py-files (job entry points are uploaded separately)
+      - name: Package code
+        run: zip -r processing.zip processing shared -x '*__pycache__*' 'processing/scripts/*'
+
+      # 2. Upload to gs://<bucket>/code/
+      - name: Upload to GCS
+        run: |
+          gcloud storage cp processing.zip "gs://${BUCKET}/code/processing.zip"
+          gcloud storage cp processing/jobs/kafka_to_bronze.py "gs://${BUCKET}/code/jobs/kafka_to_bronze.py"
