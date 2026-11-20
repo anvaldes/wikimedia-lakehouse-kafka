@@ -1,7 +1,7 @@
 import argparse
 from datetime import datetime, timezone
 
-MODES = ["stream", "backfill"]
+MODES = ["stream", "backfill", "continuous"]
 
 
 def parse_args():

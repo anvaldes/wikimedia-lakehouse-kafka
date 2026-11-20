@@ -6,6 +6,7 @@ KAFKA_BOOTSTRAP = "bootstrap-q-f3vwmc9slirwmoy56bewqjl.a6424b16f.us-central1.man
 KAFKA_TOPICS = ["recentchange", "recentchange.backfill"]
 BRONZE_DLQ_TOPIC = "recentchange.bronze.dlq"
 MAX_OFFSETS_PER_TRIGGER = 500000
+CONTINUOUS_TRIGGER = "1 minute"
 
 CATALOG = "lakehouse"
 BRONZE_TABLE = f"{CATALOG}.bronze.recentchange"

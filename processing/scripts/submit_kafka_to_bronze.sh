@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Submits kafka_to_bronze as a Serverless for Apache Spark (Dataproc serverless) batch.
-# Usage: processing/scripts/submit_kafka_to_bronze.sh YEAR MONTH DAY HOUR [stream|backfill]
+# Usage: processing/scripts/submit_kafka_to_bronze.sh YEAR MONTH DAY HOUR [stream|backfill|continuous]
 set -euo pipefail
 
 YEAR=$1 MONTH=$2 DAY=$3 HOUR=$4 MODE=${5:-stream}
+
+# Max run time: continuous runs until the TTL kills it (then it must be resubmitted); the others are a safety cap.
+if [[ "$MODE" == "continuous" ]]; then TTL=14d; else TTL=4h; fi
 
 PROJECT_ID=lab-experiments-514316
 REGION=us-central1
@@ -30,6 +33,7 @@ gcloud dataproc batches submit pyspark "gs://${BUCKET}/code/jobs/kafka_to_bronze
   --region="$REGION" \
   --batch="$BATCH_ID" \
   --version="$RUNTIME_VERSION" \
+  --ttl="$TTL" \
   --subnet=default \
   --service-account="$SERVICE_ACCOUNT" \
   --py-files="gs://${BUCKET}/code/processing.zip" \

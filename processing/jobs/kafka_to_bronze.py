@@ -1,10 +1,12 @@
 """Kafka -> Bronze (Iceberg).
 
 Modes:
-  stream   (hourly): Structured Streaming + Trigger.AvailableNow. The Spark checkpoint decides which
-                     offsets to read; --year/--month/--day/--hour only label the run in logs.
-  backfill (replay): batch read of the Kafka messages whose Kafka timestamp falls in --year/--month/--day/--hour
-                     (only possible within the topic's 7-day retention).
+  continuous (real time): Structured Streaming, one micro-batch every CONTINUOUS_TRIGGER, never ends.
+  stream     (scheduled): Structured Streaming + Trigger.AvailableNow: reads everything pending and exits.
+  backfill   (replay):    batch read of the Kafka messages whose Kafka timestamp falls in --year/--month/--day/--hour
+                          (only possible within the topic's 7-day retention).
+continuous and stream share the Spark checkpoint, so you can switch between them, but never run both at once.
+In continuous/stream the checkpoint decides which offsets to read; --year/--month/--day/--hour only label the run.
 
 Idempotency: bronze is written with MERGE on (topic, partition, offset) -> re-running any batch inserts nothing new.
 Errors go to GCS (dynamic overwrite per batch -> idempotent) and to a Kafka dead-letter topic (at-least-once).
@@ -194,11 +196,16 @@ def stream_tag(spark, batch_id):
     return f"{spark.streams.active[0].id[:8]}-{batch_id}"
 
 
-def run_stream(spark, metrics):
+def stream_trigger(mode):
+    """continuous: a micro-batch every CONTINUOUS_TRIGGER, forever. stream: everything pending, then exit."""
+    return {"processingTime": config.CONTINUOUS_TRIGGER} if mode == "continuous" else {"availableNow": True}
+
+
+def run_stream(spark, mode, metrics):
     handler = lambda df, batch_id: process_batch(df, stream_tag(spark, batch_id), metrics)
     query = (read_stream(spark).writeStream.foreachBatch(handler)
              .option("checkpointLocation", config.CHECKPOINT_PATH)
-             .trigger(availableNow=True)
+             .trigger(**stream_trigger(mode))
              .start())
     query.awaitTermination()
 
@@ -231,7 +238,7 @@ def run(spark, args, hour, metrics):
     if args.mode == "backfill":
         run_backfill(spark, hour, metrics)
     else:
-        run_stream(spark, metrics)
+        run_stream(spark, args.mode, metrics)
 
 
 def main():
@@ -244,9 +251,9 @@ def main():
     metrics = Metrics("kafka-to-bronze", mode=args.mode)
     started = time.time()
     try:
+        send_lineage()  # sent at start: in continuous mode the job never reaches its end
         run(spark, args, hour, metrics)
         metrics.record_ms("kafka_to_bronze.job_duration_ms", int((time.time() - started) * 1000))
-        send_lineage()
     finally:
         metrics.close()
 
