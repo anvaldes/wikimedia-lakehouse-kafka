@@ -114,6 +114,44 @@ def test_project_and_language(silver, case, project, language):
     assert (silver[case]["project"], silver[case]["language"]) == (project, language)
 
 
+WIKIS_FIXTURE = Path(__file__).parents[1] / "fixtures" / "wikis.csv"
+# Where the wiki-based rule intentionally differs from reading server_name.
+CHAPTERS = {"bd", "be", "br", "ca", "id", "nl", "pl", "ru", "se", "ua"}
+
+
+def expected_from_server_name(wiki, server_name):
+    """What server_name says the project/language are (independent check of the wiki-based rule)."""
+    if wiki == "sourceswiki":
+        return "wikisource", None                       # wikisource.org: multilingual, no language
+    parts = server_name.split(".")
+    subdomain, site = parts[0], parts[-2]
+    if site == "wikimedia":
+        return ("wikimedia", None) if subdomain in CHAPTERS else (subdomain, None)
+    if site in ("wikipedia", *job.LANGUAGE_PROJECTS) and subdomain != "www":
+        return site, subdomain
+    return site, None
+
+
+def test_project_and_language_match_every_real_wiki(spark):
+    import csv
+    pairs = [(r["wiki"], r["server_name"]) for r in csv.DictReader(WIKIS_FIXTURE.open())]
+    df = spark.createDataFrame(pairs, "wiki string, server_name string")
+    project, language = job.project_and_language(F.col("wiki"))
+    derived = {r.wiki: (r.project, r.language) for r in df.select("wiki", project.alias("project"),
+                                                                    language.alias("language")).collect()}
+    mismatches = {w: (derived[w], expected_from_server_name(w, s)) for w, s in pairs
+                  if derived[w] != expected_from_server_name(w, s)}
+    assert len(pairs) > 600 and mismatches == {}
+
+
+def test_central_login_events_keep_their_wikis_project(spark):
+    """newusers/create logs arrive with server_name auth.wikimedia.org but belong to the wiki in `wiki`."""
+    df = spark.createDataFrame([("enwiki", "auth.wikimedia.org"), ("enwiki", "en.wikipedia.org")],
+                               "wiki string, server_name string")
+    project, language = job.project_and_language(F.col("wiki"))
+    assert {tuple(r) for r in df.select(project, language).collect()} == {("wikipedia", "en")}
+
+
 def test_is_anonymous(silver):
     assert silver["edit_temp_account_wikipedia"]["is_anonymous"] is True
     assert silver["edit_bot_wiktionary"]["is_anonymous"] is False

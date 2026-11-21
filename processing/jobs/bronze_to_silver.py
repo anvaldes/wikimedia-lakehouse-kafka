@@ -96,9 +96,20 @@ NAMESPACES = {
     710: "TimedText", 711: "TimedText talk", 828: "Module", 829: "Module talk",
     2300: "Gadget", 2301: "Gadget talk", 2302: "Gadget definition", 2303: "Gadget definition talk",
 }
-# Projects with one wiki per language: <language>.<project>.org
-LANGUAGE_PROJECTS = ["wikipedia", "wiktionary", "wikibooks", "wikinews", "wikiquote",
-                     "wikisource", "wikiversity", "wikivoyage"]
+# project / language come from the wiki's database name, NOT from server_name: account creations and some
+# abuse-filter logs of every wiki arrive with server_name = auth.wikimedia.org (central login), which split one
+# wiki into two projects. Checked against the 635 real wiki/server_name pairs in tests/fixtures/wikis.csv.
+# Wikis with one edition per language: <language><suffix>, e.g. eswiktionary. Plain <language>wiki = Wikipedia.
+LANGUAGE_PROJECTS = ["wiktionary", "wikibooks", "wikinews", "wikiquote", "wikisource", "wikiversity", "wikivoyage"]
+# Single-language / multilingual wikis whose name doesn't follow <language><project>.
+SPECIAL_WIKIS = {
+    "commonswiki": "commons", "metawiki": "meta", "specieswiki": "species", "incubatorwiki": "incubator",
+    "foundationwiki": "foundation", "outreachwiki": "outreach", "donatewiki": "donate", "loginwiki": "login",
+    "labswiki": "wikitech", "mediawikiwiki": "mediawiki", "wikidatawiki": "wikidata",
+    "testwikidatawiki": "wikidata", "wikifunctionswiki": "wikifunctions", "sourceswiki": "wikisource",
+}
+# Database names that kept an old language code (be_x_oldwiki serves be-tarask.wikipedia.org).
+LANGUAGE_CODE_FIXES = {"be-x-old": "be-tarask"}
 # IPv4, IPv6, or temporary account (~2026-12345-67). Real events: 100% of anonymous edits are temporary accounts.
 ANONYMOUS_USER = r"^(\d{1,3}(\.\d{1,3}){3}|[0-9A-Fa-f]*:[0-9A-Fa-f:]+|~\d{4}-.*)$"
 EDIT_SIZE_BUCKETS = [(0, "none"), (50, "tiny"), (500, "small"), (5_000, "medium"), (50_000, "large")]
@@ -227,13 +238,32 @@ def flatten(valid):
     )
 
 
-def project_and_language(server_name):
-    """en.wikipedia.org -> (wikipedia, en). commons.wikimedia.org -> (commons, null). www.wikidata.org -> (wikidata, null)."""
-    parts = F.split(server_name, r"\.")
-    subdomain, site = F.element_at(parts, 1), F.element_at(parts, -2)
-    project = F.when(site == "wikimedia", subdomain).otherwise(site)
-    language = F.when(site.isin(LANGUAGE_PROJECTS) & (subdomain != "www"), subdomain)
-    return project, language
+def literal_map(mapping):
+    return F.create_map(*[F.lit(x) for pair in mapping.items() for x in pair])
+
+
+def project_and_language(wiki):
+    """From the wiki database name, so both are constant per wiki:
+    enwiki -> (wikipedia, en). eswiktionary -> (wiktionary, es). zh_min_nanwiki -> (wikipedia, zh-min-nan).
+    commonswiki -> (commons, null). wikimania2017wiki -> (wikimania2017, null). bdwikimedia (chapter) -> (wikimedia, null).
+    Anything else -> (wiki, null)."""
+    special = literal_map(SPECIAL_WIKIS)[wiki]
+    wikimania = F.regexp_extract(wiki, r"^(wikimania\d*)wiki$", 1)
+    is_chapter = wiki.rlike(r"^[a-z_]+wikimedia$")
+    by_language = rf"^([a-z0-9_]+?)({'|'.join(LANGUAGE_PROJECTS)})$"
+    suffix, suffix_language = F.regexp_extract(wiki, by_language, 2), F.regexp_extract(wiki, by_language, 1)
+    wikipedia_language = F.regexp_extract(wiki, r"^([a-z0-9_]+)wiki$", 1)
+    project = (F.when(special.isNotNull(), special)
+                .when(wikimania != "", wikimania)
+                .when(is_chapter, "wikimedia")
+                .when(suffix != "", suffix)
+                .when(wikipedia_language != "", "wikipedia")
+                .otherwise(wiki))
+    code = (F.when(special.isNotNull() | (wikimania != "") | is_chapter, F.lit(None).cast("string"))
+             .when(suffix != "", suffix_language)
+             .when(wikipedia_language != "", wikipedia_language))
+    code = F.regexp_replace(code, "_", "-")
+    return project, F.coalesce(literal_map(LANGUAGE_CODE_FIXES)[code], code)
 
 
 def namespace_name(namespace):
@@ -250,7 +280,7 @@ def edit_size_bucket(delta):
 
 
 def enrich(df):
-    project, language = project_and_language(F.col("server_name"))
+    project, language = project_and_language(F.col("wiki"))
     length_delta = F.when(F.col("length_new").isNotNull(),
                           F.col("length_new") - F.coalesce(F.col("length_old"), F.lit(0)))
     return (df.withColumn("project", project)
