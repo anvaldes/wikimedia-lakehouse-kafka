@@ -23,7 +23,7 @@ from processing.common import config
 from processing.common.args import parse_args, run_hour
 from processing.common.spark_session import create_spark, kafka_options, log_versions
 from processing.common.migrations import run_migrations
-from processing.common.iceberg import maintain
+from processing.common.iceberg import distinct_partitions, maintain, merge_insert_only
 from processing.common.metrics import Metrics
 from processing.common.lineage import emit_lineage, kafka_dataset, gcs_dataset
 
@@ -41,13 +41,7 @@ ERROR_COLUMNS = [
     "error_reason", "raw_json", "kafka_topic", "kafka_partition", "kafka_offset",
     "timestamp_kafka", "failed_at", "job", "batch",
 ]
-MERGE_SQL = f"""
-MERGE INTO {config.BRONZE_TABLE} t
-USING bronze_batch s
-ON  t.year = s.year AND t.month = s.month AND t.day = s.day AND t.hour = s.hour
-AND t.kafka_topic = s.kafka_topic AND t.kafka_partition = s.kafka_partition AND t.kafka_offset = s.kafka_offset
-WHEN NOT MATCHED THEN INSERT *
-"""
+KAFKA_KEY = ["kafka_topic", "kafka_partition", "kafka_offset"]
 
 # Same rules as the producer (shared/validation.py): empty value, invalid JSON, NaN/Infinity,
 # not a JSON object, missing or wrongly-typed required fields, unparseable meta.dt.
@@ -141,9 +135,13 @@ def write_errors_kafka(errors):
 
 
 def merge_into_bronze(rows):
-    """Insert-only MERGE on (partition cols + topic, partition, offset): duplicates are skipped."""
-    rows.createOrReplaceTempView("bronze_batch")
-    rows.sparkSession.sql(MERGE_SQL)
+    """Insert-only MERGE on (partition cols + topic, partition, offset): duplicates are skipped.
+    Bounded to the batch's partitions: without it every batch read the whole table (61 s for 3k rows at 5M rows)."""
+    rows = rows.persist()
+    try:
+        merge_insert_only(rows, config.BRONZE_TABLE, KAFKA_KEY, distinct_partitions(rows), "bronze_batch")
+    finally:
+        rows.unpersist()
 
 
 def write_outputs(prepared, counts, started, tag):
