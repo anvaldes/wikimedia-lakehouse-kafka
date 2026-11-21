@@ -16,6 +16,10 @@ Every run / micro-batch:
   3. quality checks on all of them: any critical failure -> nothing is written, the job fails
   4. replace exactly those hours' partitions in each table (overwrite by partition filter)
 
+Pipeline fields: every table carries the previous layers' timestamps (max over the row's events) and latencies
+(average ms), plus its own timestamp_gold_<table> / latency_gold_<table> / latency_processing_<table>, stamped
+right before writing that table (same meaning as timestamp_silver / latency_to_silver / latency_processing_silver).
+
 Idempotency: partitions are replaced as a whole, even when the new result is empty (e.g. an hour that no longer
 has anomalies), so recomputing an hour always gives the same rows. While an hour is still open its rows are
 provisional (anomalies included); the micro-batch that brings its last events makes them final.
@@ -31,7 +35,7 @@ from pyspark.sql import functions as F
 
 from processing.common import config, quality
 from processing.common.args import parse_args, run_hour
-from processing.common.columns import PARTITIONS, utc_now
+from processing.common.columns import PARTITIONS, ms_between, ms_since, utc_now
 from processing.common.iceberg import maintain, partition_predicate
 from processing.common.lineage import emit_lineage, gcs_dataset
 from processing.common.metrics import Metrics
@@ -46,9 +50,18 @@ MIGRATIONS = ["003_create_gold.sql"]
 
 # ---------- input contract: the silver columns this job uses ----------
 
+# Pipeline timestamps and latencies of the previous layers, carried into every gold table (aggregated per row):
+# timestamps -> max (the latest event in the row), latencies -> average in ms over the row's events.
+UPSTREAM_TIMESTAMPS = ["event_ts", "ingested_at", "timestamp_kafka", "timestamp_bronze", "timestamp_silver"]
+UPSTREAM = [
+    "event_ts", "ingested_at", "timestamp_kafka", "timestamp_bronze",
+    "latency_to_kafka", "latency_to_bronze", "latency_processing_bronze",
+    "timestamp_silver", "latency_to_silver", "latency_processing_silver",
+]
+
 SILVER_FIELDS = [
-    "meta_id", "event_ts", "wiki", "project", "language", "type", "namespace_name", "title", "user",
-    "bot", "is_anonymous", "minor", "length_delta", "edit_size_bucket", *PARTITIONS,
+    "meta_id", "wiki", "project", "language", "type", "namespace_name", "title", "user",
+    "bot", "is_anonymous", "minor", "length_delta", "edit_size_bucket", *UPSTREAM, *PARTITIONS,
 ]
 
 # ---------- rules ----------
@@ -68,13 +81,12 @@ WIKI_KEYS = ["wiki", "project", "language"]
 GROUP_KEYS = [*HOUR_KEYS, *WIKI_KEYS]
 WIKI_HOUR = [*PARTITIONS, "wiki"]  # one wiki in one hour (window partition for percentages)
 HEAD = ["hour_ts", *WIKI_KEYS]
-TAIL = ["gold_processed_at", *PARTITIONS]
 
 
 @dataclass(frozen=True, eq=False)  # compared/hashed by identity: used as dict key
 class GoldTable:
     name: str
-    columns: List[str]
+    body: List[str]                 # the table's own dimensions and metrics
     keys: List[str]                 # granularity: unique per row
     count_columns: List[str]        # must never be negative
 
@@ -82,38 +94,59 @@ class GoldTable:
     def table(self):
         return config.GOLD_TABLES[self.name]
 
+    @property
+    def gold_timestamp(self):
+        return f"timestamp_gold_{self.name}"
+
+    @property
+    def gold_latency(self):
+        return f"latency_gold_{self.name}"
+
+    @property
+    def gold_processing(self):
+        return f"latency_processing_{self.name}"
+
+    @property
+    def built_columns(self):
+        """What the transform function returns (checked by the quality checks)."""
+        return [*HEAD, *self.body, *UPSTREAM, "gold_processed_at", *PARTITIONS]
+
+    @property
+    def columns(self):
+        """What is written: + this table's gold timestamp and latencies, stamped right before writing it."""
+        return [*HEAD, *self.body, *UPSTREAM, "gold_processed_at",
+                self.gold_timestamp, self.gold_latency, self.gold_processing, *PARTITIONS]
+
 
 ACTIVITY = GoldTable(
     "activity_hourly",
-    [*HEAD, "total_events", "edits", "new_pages", "log_events", "categorize_events", "unique_editors",
-     "unique_pages", "minor_edits", "anonymous_edits", "anonymous_pct", "bytes_added", "bytes_removed",
-     "net_bytes", *TAIL],
+    ["total_events", "edits", "new_pages", "log_events", "categorize_events", "unique_editors",
+     "unique_pages", "minor_edits", "anonymous_edits", "anonymous_pct", "bytes_added", "bytes_removed", "net_bytes"],
     keys=WIKI_HOUR,
     count_columns=["total_events", "edits", "new_pages", "log_events", "categorize_events", "unique_editors",
                    "unique_pages", "minor_edits", "anonymous_edits", "bytes_added", "bytes_removed"],
 )
 BOTS_VS_HUMANS = GoldTable(
     "bots_vs_humans_hourly",
-    [*HEAD, "editor_type", "events", "edits", "new_pages", "unique_editors", "net_bytes", "pct_of_wiki_events", *TAIL],
+    ["editor_type", "events", "edits", "new_pages", "unique_editors", "net_bytes", "pct_of_wiki_events"],
     keys=[*WIKI_HOUR, "editor_type"],
     count_columns=["events", "edits", "new_pages", "unique_editors"],
 )
 TRENDING = GoldTable(
     "trending_pages_hourly",
-    [*HEAD, "title", "edits_in_hour", "unique_editors", "bot_edits", "human_edits", "net_bytes", "rank_in_wiki", *TAIL],
+    ["title", "edits_in_hour", "unique_editors", "bot_edits", "human_edits", "net_bytes", "rank_in_wiki"],
     keys=[*WIKI_HOUR, "title"],
     count_columns=["edits_in_hour", "unique_editors", "bot_edits", "human_edits"],
 )
 EDIT_SIZE = GoldTable(
     "edit_size_hourly",
-    [*HEAD, "edit_size_bucket", "edits", "avg_length_delta", "pct_of_wiki_edits", *TAIL],
+    ["edit_size_bucket", "edits", "avg_length_delta", "pct_of_wiki_edits"],
     keys=[*WIKI_HOUR, "edit_size_bucket"],
     count_columns=["edits"],
 )
 ANOMALIES = GoldTable(
     "anomalies_hourly",
-    [*HEAD, "title", "edits_in_hour", "unique_editors", "baseline_avg_edits", "baseline_stddev", "z_score",
-     "is_anomaly", *TAIL],
+    ["title", "edits_in_hour", "unique_editors", "baseline_avg_edits", "baseline_stddev", "z_score", "is_anomaly"],
     keys=[*WIKI_HOUR, "title"],
     count_columns=["edits_in_hour", "unique_editors"],
 )
@@ -185,8 +218,24 @@ def share_of_wiki_hour(column):
     return F.col(column) / F.sum(column).over(Window.partitionBy(*WIKI_HOUR))
 
 
+def upstream():
+    """Aggregates of the previous layers' timestamps (max) and latencies (average ms), for any groupBy."""
+    return [F.max(c).alias(c) if c in UPSTREAM_TIMESTAMPS else F.round(F.avg(c)).cast("long").alias(c)
+            for c in UPSTREAM]
+
+
 def finish(df, table, processed_at):
-    return df.withColumn("gold_processed_at", F.lit(processed_at)).select(*table.columns)
+    return df.withColumn("gold_processed_at", F.lit(processed_at)).select(*table.built_columns)
+
+
+def stamp_gold(df, table, started):
+    """timestamp_gold_<table> = processing of this table finished, right before writing it (same meaning as
+    timestamp_bronze / timestamp_silver). latency_gold_<table> = timestamp_gold - latest timestamp_silver of the row.
+    latency_processing_<table> = ms from the start of the gold batch to that moment."""
+    df = df.withColumn(table.gold_timestamp, F.lit(utc_now()))
+    df = df.withColumn(table.gold_latency, ms_between(table.gold_timestamp, "timestamp_silver"))
+    df = df.withColumn(table.gold_processing, F.lit(ms_since(started)).cast("long"))
+    return df.select(*table.columns)
 
 
 def with_hour_ts(silver):
@@ -214,6 +263,7 @@ def activity_hourly(silver, processed_at):
         sum_or_zero(F.when(F.col("length_delta") > 0, F.col("length_delta"))).alias("bytes_added"),
         sum_or_zero(F.when(F.col("length_delta") < 0, -F.col("length_delta"))).alias("bytes_removed"),
         sum_or_zero("length_delta").alias("net_bytes"),
+        *upstream(),
     )
     df = df.withColumn("anonymous_pct", F.when(edits_and_new > 0, F.col("anonymous_edits") / edits_and_new)
                        .otherwise(F.lit(0.0)))
@@ -233,6 +283,7 @@ def bots_vs_humans_hourly(silver, processed_at):
         count_if(is_type("new")).alias("new_pages"),
         F.countDistinct("user").alias("unique_editors"),
         sum_or_zero("length_delta").alias("net_bytes"),
+        *upstream(),
     )
     return finish(df.withColumn("pct_of_wiki_events", share_of_wiki_hour("events")), BOTS_VS_HUMANS, processed_at)
 
@@ -246,6 +297,7 @@ def trending_pages_hourly(silver, processed_at):
         F.countDistinct("user").alias("unique_editors"),
         count_if(F.col("bot")).alias("bot_edits"),
         sum_or_zero("length_delta").alias("net_bytes"),
+        *upstream(),
     ).withColumn("human_edits", F.col("edits_in_hour") - F.col("bot_edits"))
     ranking = [F.col("edits_in_hour").desc(), F.col("unique_editors").desc()]
     by_wiki_hour = Window.partitionBy(*WIKI_HOUR)
@@ -259,6 +311,7 @@ def edit_size_hourly(silver, processed_at):
     df = with_hour_ts(silver).filter(is_type("edit")).groupBy(*GROUP_KEYS, "edit_size_bucket").agg(
         F.count(F.lit(1)).alias("edits"),
         F.avg("length_delta").alias("avg_length_delta"),
+        *upstream(),
     )
     return finish(df.withColumn("pct_of_wiki_edits", share_of_wiki_hour("edits")), EDIT_SIZE, processed_at)
 
@@ -272,6 +325,7 @@ def score_pages(window, hours):
     current = edits.filter(in_hours(hours)).groupBy(*GROUP_KEYS, "title").agg(
         F.count(F.lit(1)).alias("edits_in_hour"),
         F.countDistinct("user").alias("unique_editors"),
+        *upstream(),  # of the page's events in the scored hour
     )
     history = (edits.groupBy("wiki", "title", "hour_ts").agg(F.count(F.lit(1)).alias("n"))
                     .select(F.col("wiki").alias("_wiki"), F.col("title").alias("_title"),
@@ -355,9 +409,10 @@ def read_silver(spark, scope):
             .select(*SILVER_FIELDS))
 
 
-def write_table(table, df, scope):
-    """Replaces exactly the scope's partitions of the table (also when df is empty)."""
-    df.select(*table.columns).writeTo(table.table).overwrite(F.expr(partition_predicate(scope.partitions_of(table))))
+def write_table(table, df, scope, started):
+    """Stamps the table's gold timestamp/latencies and replaces exactly the scope's partitions (also when df is empty)."""
+    stamped = stamp_gold(df, table, started)
+    stamped.writeTo(table.table).overwrite(F.expr(partition_predicate(scope.partitions_of(table))))
 
 
 # ---------- batch ----------
@@ -375,7 +430,7 @@ def process(spark, scope, tag, metrics):
         quality.enforce(results)  # nothing has been written yet
         written = {}
         for table, df in tables.items():
-            write_table(table, df, scope)
+            write_table(table, df, scope, started)
             written[table.name] = df.count()
             metrics.add(f"{METRIC}.rows_written", written[table.name], table=table.name)
         elapsed = int((utc_now() - started).total_seconds() * 1000)

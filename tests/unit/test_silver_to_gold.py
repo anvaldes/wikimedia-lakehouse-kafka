@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 from pyspark.sql import functions as F
-from pyspark.sql.types import (BooleanType, IntegerType, StringType, StructField, StructType, TimestampType)
+from pyspark.sql.types import (BooleanType, IntegerType, LongType, StringType, StructField, StructType,
+                               TimestampType)
 
 from processing.common import quality
 from processing.jobs import bronze_to_silver
@@ -35,8 +36,14 @@ SILVER_SCHEMA = StructType([
     StructField("user", StringType()), StructField("bot", BooleanType()), StructField("is_anonymous", BooleanType()),
     StructField("minor", BooleanType()), StructField("length_delta", IntegerType()),
     StructField("edit_size_bucket", StringType()),
+    StructField("ingested_at", TimestampType()), StructField("timestamp_kafka", TimestampType()),
+    StructField("timestamp_bronze", TimestampType()), StructField("latency_to_kafka", LongType()),
+    StructField("latency_to_bronze", LongType()), StructField("latency_processing_bronze", LongType()),
+    StructField("timestamp_silver", TimestampType()), StructField("latency_to_silver", LongType()),
+    StructField("latency_processing_silver", LongType()),
     *[StructField(name, StringType()) for name in ("year", "month", "day", "hour")],
 ])
+TIMESTAMP_FIELDS = {f.name for f in SILVER_SCHEMA.fields if isinstance(f.dataType, TimestampType)}
 
 
 @pytest.fixture(scope="module")
@@ -45,7 +52,8 @@ def window(spark):
     rows = []
     for line in FIXTURE.read_text().splitlines():
         row = json.loads(line)
-        row["event_ts"] = datetime.fromisoformat(row["event_ts"])
+        for name in TIMESTAMP_FIELDS:
+            row[name] = datetime.fromisoformat(row[name])
         rows.append(tuple(row[field.name] for field in SILVER_SCHEMA.fields))
     return spark.createDataFrame(rows, SILVER_SCHEMA).select(*job.SILVER_FIELDS).cache()
 
@@ -93,7 +101,42 @@ def test_job_columns_match_the_ddl(table):
 
 @pytest.mark.parametrize("table", job.TABLES, ids=lambda t: t.name)
 def test_tables_follow_their_contract(tables, table):
-    assert tables[table.name].columns == table.columns
+    assert tables[table.name].columns == table.built_columns
+    stamped = job.stamp_gold(tables[table.name], table, job.utc_now())
+    assert stamped.columns == table.columns
+
+
+@pytest.mark.parametrize("table", job.TABLES, ids=lambda t: t.name)
+def test_every_table_carries_all_pipeline_fields_and_its_own_gold_fields(table):
+    for column in job.UPSTREAM:  # every timestamp and latency of bronze and silver
+        assert column in table.columns
+    own = [f"timestamp_gold_{table.name}", f"latency_gold_{table.name}", f"latency_processing_{table.name}"]
+    assert all(column in table.columns for column in own)
+    others = [t.name for t in job.TABLES if t is not table]
+    assert not any(other in column for column in table.columns for other in others)
+
+
+def test_pipeline_timestamps_are_the_latest_and_latencies_the_average(tables, window):
+    en = one(tables["activity_hourly"], wiki="enwiki", hour="10")
+    assert (en.latency_to_kafka, en.latency_to_bronze, en.latency_processing_bronze) == (100, 20000, 5000)
+    assert (en.latency_to_silver, en.latency_processing_silver) == (30000, 4000)
+    expected = (window.filter("wiki = 'enwiki' AND day = '21' AND hour = '10'")
+                .agg(*[F.max(c).alias(c) for c in job.UPSTREAM_TIMESTAMPS]).first())
+    assert all(en[c] == expected[c] for c in job.UPSTREAM_TIMESTAMPS)
+    spike = one(tables["trending_pages_hourly"], wiki="enwiki", title="Spike page")
+    assert spike.latency_to_silver == 30000             # average of 20 s and 40 s
+
+
+def test_gold_stamp_measures_latency_from_the_latest_silver_row(tables):
+    table = job.ACTIVITY
+    started = job.utc_now()
+    stamped = job.stamp_gold(tables[table.name], table, started).filter("wiki = 'enwiki' AND hour = '10'")
+    row = stamped.select(
+        F.expr(f"(unix_micros({table.gold_timestamp}) - unix_micros(timestamp_silver)) DIV 1000").alias("expected"),
+        table.gold_latency, table.gold_processing).first()
+    # (the fixture's hour may be later than "now" when the tests run, so only the formula is checked)
+    assert row[table.gold_latency] == row["expected"]
+    assert row[table.gold_processing] >= 0
 
 
 def test_unique_counts_are_documented_as_not_summable():

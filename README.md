@@ -17,6 +17,14 @@ It runs in one of three modes, like the other jobs:
 | `edit_size_hourly` | hour × wiki × size bucket | How large the edits are (silver's `edit_size_bucket`) |
 | `anomalies_hourly` | hour × wiki × page | Which pages had an edit spike: z-score > 3 against the previous 24 h, with at least 10 edits |
 
+**Every gold table carries the pipeline's timing,** so you can follow the end-to-end latency table by table:
+- The timestamps of the previous layers (`event_ts`, `ingested_at`, `timestamp_kafka`, `timestamp_bronze`, `timestamp_silver`) hold the **maximum** over the row's events, that is, the latest event in the row.
+- Their latencies (`latency_to_kafka`, `latency_to_bronze`, `latency_processing_bronze`, `latency_to_silver`, `latency_processing_silver`) hold the **average** in ms over those events.
+- Each table also has its own gold fields:
+  - `timestamp_gold_<table>`: when gold finished computing the table, right before writing it.
+  - `latency_gold_<table>`: `timestamp_gold_<table> − timestamp_silver`.
+  - `latency_processing_<table>`: the ms from the start of the gold batch (`gold_processed_at`) to that moment.
+
 **`unique_editors` and `unique_pages` can't be summed.** They are `COUNT(DISTINCT)` values: the same editor or page can show up in several hours, wikis or editor types, so summing the rows counts it more than once. To get distinct counts over a longer period or across several wikis, recompute them from `silver.recentchange`. Every other count (`total_events`, `edits`, `net_bytes`, …) can be summed.
 
 Anomaly scores need 24 hours of silver data before the scored hour. During the first 24 hours of the history, the baseline is incomplete and the job flags more pages than it should.
