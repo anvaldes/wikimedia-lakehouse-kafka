@@ -22,15 +22,15 @@ class Metrics:
             self.instruments[name] = factory(name, **kwargs)
         return self.instruments[name]
 
-    def add(self, name, value):
+    def add(self, name, value, **attributes):
         if self.meter:
-            self._get(name, self.meter.create_counter).add(value, self.attributes)
+            self._get(name, self.meter.create_counter).add(value, {**self.attributes, **attributes})
 
-    def record_ms(self, name, value):
+    def record_ms(self, name, value, **attributes):
         if self.meter:
             histogram = self._get(name, self.meter.create_histogram, unit="ms",
                                   explicit_bucket_boundaries_advisory=LATENCY_BUCKETS_MS)
-            histogram.record(value, self.attributes)
+            histogram.record(value, {**self.attributes, **attributes})
 
     def close(self):
         """The process exits right after, so metrics must be pushed now."""

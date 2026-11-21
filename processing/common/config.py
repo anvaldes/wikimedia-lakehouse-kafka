@@ -16,3 +16,24 @@ BRONZE_TABLE_PATH = "bronze/recentchange"
 CHECKPOINT_PATH = f"gs://{BUCKET}/bronze/checkpoints-kafka-to-bronze"
 ERRORS_PREFIX = "bronze/errors-kafka-to-bronze"
 ERRORS_PATH = f"gs://{BUCKET}/{ERRORS_PREFIX}"
+
+# ---------- silver ----------
+SILVER_TABLE = f"{CATALOG}.silver.recentchange"
+SILVER_TABLE_PATH = "silver/recentchange"
+SILVER_QUARANTINE_TABLE = f"{CATALOG}.silver.recentchange_quarantine"
+SILVER_QUARANTINE_PATH = "silver/recentchange_quarantine"
+SILVER_DLQ_TOPIC = "recentchange.silver.dlq"
+SILVER_CHECKPOINT_PATH = f"gs://{BUCKET}/silver/checkpoints-bronze-to-silver"
+# Rate limit when streaming from bronze (first run catches up on the whole bronze history).
+BRONZE_MAX_FILES_PER_TRIGGER = 1000
+
+# ---------- Iceberg maintenance ----------
+# BigLake's REST catalog rejects a metadata.json over ~1 MiB and every commit adds ~900 bytes (one snapshot).
+# kafka_to_bronze died this way on 2026-11-20 after ~1150 one-minute commits ("Table metadata is too large").
+# 6 h of one-minute commits is ~360 snapshots (~350 KB). A stream reading a table must not lag more than this.
+SNAPSHOT_RETENTION_HOURS = 6
+MAINTENANCE_EVERY_BATCHES = 60
+METADATA_PROPERTIES = {
+    "write.metadata.delete-after-commit.enabled": "true",
+    "write.metadata.previous-versions-max": "20",
+}

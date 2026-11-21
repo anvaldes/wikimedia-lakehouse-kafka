@@ -23,6 +23,7 @@ from processing.common import config
 from processing.common.args import parse_args, run_hour
 from processing.common.spark_session import create_spark, kafka_options, log_versions
 from processing.common.migrations import run_migrations
+from processing.common.iceberg import maintain
 from processing.common.metrics import Metrics
 from processing.common.lineage import emit_lineage, kafka_dataset, gcs_dataset
 
@@ -202,7 +203,10 @@ def stream_trigger(mode):
 
 
 def run_stream(spark, mode, metrics):
-    handler = lambda df, batch_id: process_batch(df, stream_tag(spark, batch_id), metrics)
+    def handler(df, batch_id):
+        process_batch(df, stream_tag(spark, batch_id), metrics)
+        maintain(spark, [config.BRONZE_TABLE], batch_id)  # expire snapshots: see config.SNAPSHOT_RETENTION_HOURS
+
     query = (read_stream(spark).writeStream.queryName(JOB_NAME).foreachBatch(handler)
              .option("checkpointLocation", config.CHECKPOINT_PATH)
              .trigger(**stream_trigger(mode))
@@ -248,6 +252,7 @@ def main():
     spark = create_spark(JOB_NAME)
     log_versions(spark)
     run_migrations(spark, MIGRATIONS)
+    maintain(spark, [config.BRONZE_TABLE])  # also unblocks a table whose metadata grew past BigLake's limit
     metrics = Metrics("kafka-to-bronze", mode=args.mode)
     started = time.time()
     try:

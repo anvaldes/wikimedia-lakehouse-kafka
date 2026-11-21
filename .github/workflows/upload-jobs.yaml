@@ -12,7 +12,28 @@ env:
   BUCKET: wikimedia-lakehouse-kafka
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Python 3.11 = Dataproc Serverless runtime 2.2. Java 17 is preinstalled on ubuntu-latest.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: pytest -q
+
   upload-jobs:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -32,8 +53,8 @@ jobs:
       - name: Package code
         run: zip -r processing.zip processing shared -x '*__pycache__*' 'processing/scripts/*'
 
-      # 2. Upload to gs://<bucket>/code/
+      # 2. Upload to gs://<bucket>/code/ (every job entry point in processing/jobs/)
       - name: Upload to GCS
         run: |
           gcloud storage cp processing.zip "gs://${BUCKET}/code/processing.zip"
-          gcloud storage cp processing/jobs/kafka_to_bronze.py "gs://${BUCKET}/code/jobs/kafka_to_bronze.py"
+          gcloud storage cp processing/jobs/*.py "gs://${BUCKET}/code/jobs/"
