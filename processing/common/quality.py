@@ -10,7 +10,8 @@ Critical checks that fail make enforce() raise; non-critical ones are only repor
 """
 import json
 import operator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import reduce
 from typing import Any, List
 
 from pyspark.sql import Column
@@ -65,6 +66,40 @@ def min_value(name, value, minimum, critical=True):
     return Check(name, value, ">=", minimum, critical)
 
 
+def no_negatives(columns, critical=True):
+    """Rows x columns with a negative value (counts can't be negative)."""
+    negatives = reduce(operator.add, [F.when(F.col(c) < 0, 1).otherwise(0) for c in columns])
+    return Check("no_negative_counts", F.sum(negatives), "<=", 0, critical)
+
+
+# The checks below need a groupBy or a join, so they are computed when the Check is built (one action each).
+
+def no_duplicate_keys(df, keys, critical=True):
+    """Granularity keys that appear more than once."""
+    duplicated = df.groupBy(*keys).count().filter(F.col("count") > 1).count()
+    return Check("no_duplicate_keys", duplicated, "<=", 0, critical)
+
+
+def group_sums_to(df, keys, column, expected=1.0, tolerance=1e-6, critical=True):
+    """Groups whose sum(column) is not expected (+- tolerance), e.g. percentages that must add up to 1."""
+    sums = df.groupBy(*keys).agg(F.sum(column).alias("_sum"))
+    off = sums.filter(F.abs(F.col("_sum") - F.lit(expected)) > tolerance).count()
+    return Check(f"{column}_sums_to_{expected:g}", off, "<=", 0, critical)
+
+
+def max_rows_per_group(df, keys, maximum, critical=True):
+    largest = df.groupBy(*keys).count().agg(F.max("count")).first()[0]
+    return Check("max_rows_per_group", largest or 0, "<=", maximum, critical)
+
+
+def counts_match(name, actual, expected, keys, critical=True):
+    """Keys where actual.value != expected.value (both DataFrames: keys + a 'value' column; missing = 0)."""
+    joined = actual.withColumnRenamed("value", "_actual").join(
+        expected.withColumnRenamed("value", "_expected"), list(keys), "full_outer")
+    mismatched = joined.filter(F.coalesce("_actual", F.lit(0)) != F.coalesce("_expected", F.lit(0))).count()
+    return Check(name, mismatched, "<=", 0, critical)
+
+
 # ---------- run ----------
 
 def run_checks(df, checks: List[Check]) -> List[CheckResult]:
@@ -77,6 +112,11 @@ def run_checks(df, checks: List[Check]) -> List[CheckResult]:
         passed = COMPARISONS[check.comparison](value, check.threshold)
         results.append(CheckResult(check.name, value, check.comparison, check.threshold, check.critical, passed))
     return results
+
+
+def prefixed(results, prefix):
+    """Same results named <prefix>.<check>, to run the same checks on several tables."""
+    return [replace(r, name=f"{prefix}.{r.name}") for r in results]
 
 
 def failed_critical(results):

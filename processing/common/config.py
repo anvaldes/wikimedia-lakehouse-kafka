@@ -27,6 +27,13 @@ SILVER_CHECKPOINT_PATH = f"gs://{BUCKET}/silver/checkpoints-bronze-to-silver"
 # Rate limit when streaming from bronze (first run catches up on the whole bronze history).
 BRONZE_MAX_FILES_PER_TRIGGER = 1000
 
+# ---------- gold ----------
+GOLD_NAMESPACE = f"{CATALOG}.gold"
+GOLD_TABLE_NAMES = ["activity_hourly", "bots_vs_humans_hourly", "trending_pages_hourly",
+                    "edit_size_hourly", "anomalies_hourly"]
+GOLD_TABLES = {name: f"{GOLD_NAMESPACE}.{name}" for name in GOLD_TABLE_NAMES}
+GOLD_TABLE_PATHS = {name: f"gold/{name}" for name in GOLD_TABLE_NAMES}
+
 # ---------- Iceberg maintenance ----------
 # BigLake's REST catalog rejects a metadata.json over ~1 MiB and every commit adds ~900 bytes (one snapshot).
 # kafka_to_bronze died this way on 2026-11-20 after ~1150 one-minute commits ("Table metadata is too large").
