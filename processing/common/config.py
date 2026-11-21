@@ -33,6 +33,11 @@ GOLD_TABLE_NAMES = ["activity_hourly", "bots_vs_humans_hourly", "trending_pages_
                     "edit_size_hourly", "anomalies_hourly"]
 GOLD_TABLES = {name: f"{GOLD_NAMESPACE}.{name}" for name in GOLD_TABLE_NAMES}
 GOLD_TABLE_PATHS = {name: f"gold/{name}" for name in GOLD_TABLE_NAMES}
+GOLD_CHECKPOINT_PATH = f"gs://{BUCKET}/gold/checkpoints-silver-to-gold"
+# Each micro-batch recomputes whole hours (+ 24 h of anomaly baseline): every 5 minutes is fresh enough
+# and keeps the work and the commits (5 tables) low.
+GOLD_TRIGGER = "5 minutes"
+SILVER_MAX_FILES_PER_TRIGGER = 2000
 
 # ---------- Iceberg maintenance ----------
 # BigLake's REST catalog rejects a metadata.json over ~1 MiB and every commit adds ~900 bytes (one snapshot).

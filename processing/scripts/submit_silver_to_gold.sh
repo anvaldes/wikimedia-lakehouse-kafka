@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Submits silver_to_gold as a Serverless for Apache Spark (Dataproc serverless) batch.
-# Usage: processing/scripts/submit_silver_to_gold.sh YEAR MONTH DAY HOUR
-#   Rewrites the gold partitions of hour H and H-1 (anomalies: only H), H = YEAR MONTH DAY HOUR in UTC.
-#   Run it a few minutes after the hour closes, e.g. at 11:10 UTC with H = 10.
+# Usage: processing/scripts/submit_silver_to_gold.sh YEAR MONTH DAY HOUR [stream|backfill|continuous]
+#   continuous: 24/7, every 5 minutes recomputes the hours that received new silver rows (YEAR..HOUR only label the run)
+#   backfill:   rewrites hours H and H-1 (anomalies: only H), H = YEAR MONTH DAY HOUR in UTC
 set -euo pipefail
 
-YEAR=$1 MONTH=$2 DAY=$3 HOUR=$4
+YEAR=$1 MONTH=$2 DAY=$3 HOUR=$4 MODE=${5:-stream}
 
-# Safety cap: one hour of silver (+ 24 h for the anomaly baseline) takes minutes.
-TTL=1h
+# Max run time: continuous runs until the TTL stops it (one week); the others are a safety cap.
+if [[ "$MODE" == "continuous" ]]; then TTL=7d; else TTL=4h; fi
 
 # Cost cap: fixed at the minimum of 2 executors, never scales up.
 SPARK_PROPERTIES="spark.executor.instances=2#spark.dynamicAllocation.minExecutors=2#spark.dynamicAllocation.maxExecutors=2"
@@ -28,7 +28,7 @@ PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.5_${SCALA_VERSION}:${ICEBER
 PACKAGES+=",org.apache.iceberg:iceberg-gcp-bundle:${ICEBERG_VERSION}"
 
 # 10# forces base 10: bash would read "08" / "09" as invalid octal numbers
-BATCH_ID="silver-to-gold-$(printf '%04d%02d%02d%02d' $((10#$YEAR)) $((10#$MONTH)) $((10#$DAY)) $((10#$HOUR)))-$(date +%s)"
+BATCH_ID="silver-to-gold-${MODE}-$(printf '%04d%02d%02d%02d' $((10#$YEAR)) $((10#$MONTH)) $((10#$DAY)) $((10#$HOUR)))-$(date +%s)"
 
 # ^#^ switches gcloud's list delimiter to '#' because spark.jars.packages contains commas.
 gcloud dataproc batches submit pyspark "gs://${BUCKET}/code/jobs/silver_to_gold.py" \
@@ -41,4 +41,4 @@ gcloud dataproc batches submit pyspark "gs://${BUCKET}/code/jobs/silver_to_gold.
   --service-account="$SERVICE_ACCOUNT" \
   --py-files="gs://${BUCKET}/code/processing.zip" \
   --properties="^#^spark.jars.packages=${PACKAGES}#${SPARK_PROPERTIES}" \
-  -- --year "$YEAR" --month "$MONTH" --day "$DAY" --hour "$HOUR"
+  -- --year "$YEAR" --month "$MONTH" --day "$DAY" --hour "$HOUR" --mode "$MODE"

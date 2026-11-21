@@ -5,9 +5,9 @@ from processing.common import config
 from processing.common.spark_session import kafka_options
 
 
-def stream_trigger(mode):
-    """continuous: a micro-batch every CONTINUOUS_TRIGGER, forever. stream: everything pending, then exit."""
-    return {"processingTime": config.CONTINUOUS_TRIGGER} if mode == "continuous" else {"availableNow": True}
+def stream_trigger(mode, interval=config.CONTINUOUS_TRIGGER):
+    """continuous: a micro-batch every interval, forever. stream: everything pending, then exit."""
+    return {"processingTime": interval} if mode == "continuous" else {"availableNow": True}
 
 
 def stream_tag(spark, batch_id):

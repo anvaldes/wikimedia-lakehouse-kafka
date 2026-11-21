@@ -1,24 +1,29 @@
 """Silver (Iceberg) -> Gold (Iceberg): hourly aggregates.
 
-One hourly batch per run (no streaming): --year/--month/--day/--hour = H, in UTC. --mode is not used.
-  activity_hourly, bots_vs_humans_hourly, trending_pages_hourly, edit_size_hourly: hours H and H-1
-  anomalies_hourly: hour H only, scored against the same page in H-24 .. H-1
-Reads only silver.recentchange, bounded to the partitions it needs (H-24 .. H).
+Modes (same as the other jobs):
+  continuous (real time): Structured Streaming over the silver table's new snapshots, a micro-batch every
+                          GOLD_TRIGGER, never ends. Each micro-batch looks at which event hours its new silver rows
+                          belong to and recomputes those whole hours (late events included, whatever hour).
+                          A NEW checkpoint starts at silver's oldest retained snapshot (silver keeps 6 h of them):
+                          older history must be loaded with backfill.
+  stream     (scheduled): same source + Trigger.AvailableNow: processes everything new and exits.
+  backfill   (replay):    hours H and H-1 (H = --year/--month/--day/--hour), anomalies only for H.
+continuous and stream share the Spark checkpoint, so you can switch between them, but never run both at once.
 
-Per run:
-  1. read silver H-24 .. H (one read, reused by every table)
+Every run / micro-batch:
+  1. read silver for the hours to recompute + the 24 h before them (anomaly baseline), one bounded read
   2. build the 5 tables (one function each)
   3. quality checks on all of them: any critical failure -> nothing is written, the job fails
-  4. replace the partitions of the run in each table (overwrite by partition filter)
+  4. replace exactly those hours' partitions in each table (overwrite by partition filter)
 
-Idempotency: each table's partitions for the run are replaced as a whole, even when the new result is empty
-(e.g. an hour that no longer has anomalies), so re-running the same hour gives exactly the same tables.
-Run it a few minutes after the hour closes (e.g. at HH:10 for H = HH-1): H-1 is recomputed to absorb late events.
+Idempotency: partitions are replaced as a whole, even when the new result is empty (e.g. an hour that no longer
+has anomalies), so recomputing an hour always gives the same rows. While an hour is still open its rows are
+provisional (anomalies included); the micro-batch that brings its last events makes them final.
 """
 import sys
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 from pyspark.sql import Window
@@ -32,6 +37,7 @@ from processing.common.lineage import emit_lineage, gcs_dataset
 from processing.common.metrics import Metrics
 from processing.common.migrations import run_migrations
 from processing.common.spark_session import create_spark, log_versions
+from processing.common.streaming import stream_tag, stream_trigger
 from shared.partitions import get_partition
 
 JOB_NAME = "silver_to_gold"
@@ -47,7 +53,6 @@ SILVER_FIELDS = [
 
 # ---------- rules ----------
 
-SCOPE_HOURS = 2             # H and H-1
 BASELINE_HOURS = 24         # anomalies: H-24 .. H-1
 TOP_PAGES = 20
 ARTICLE_NAMESPACE = "Main"  # silver's name for namespace 0 (articles)
@@ -72,7 +77,6 @@ class GoldTable:
     columns: List[str]
     keys: List[str]                 # granularity: unique per row
     count_columns: List[str]        # must never be negative
-    lookback_hours: int             # partitions rewritten per run: H-(n-1) .. H
 
     @property
     def table(self):
@@ -87,28 +91,24 @@ ACTIVITY = GoldTable(
     keys=WIKI_HOUR,
     count_columns=["total_events", "edits", "new_pages", "log_events", "categorize_events", "unique_editors",
                    "unique_pages", "minor_edits", "anonymous_edits", "bytes_added", "bytes_removed"],
-    lookback_hours=SCOPE_HOURS,
 )
 BOTS_VS_HUMANS = GoldTable(
     "bots_vs_humans_hourly",
     [*HEAD, "editor_type", "events", "edits", "new_pages", "unique_editors", "net_bytes", "pct_of_wiki_events", *TAIL],
     keys=[*WIKI_HOUR, "editor_type"],
     count_columns=["events", "edits", "new_pages", "unique_editors"],
-    lookback_hours=SCOPE_HOURS,
 )
 TRENDING = GoldTable(
     "trending_pages_hourly",
     [*HEAD, "title", "edits_in_hour", "unique_editors", "bot_edits", "human_edits", "net_bytes", "rank_in_wiki", *TAIL],
     keys=[*WIKI_HOUR, "title"],
     count_columns=["edits_in_hour", "unique_editors", "bot_edits", "human_edits"],
-    lookback_hours=SCOPE_HOURS,
 )
 EDIT_SIZE = GoldTable(
     "edit_size_hourly",
     [*HEAD, "edit_size_bucket", "edits", "avg_length_delta", "pct_of_wiki_edits", *TAIL],
     keys=[*WIKI_HOUR, "edit_size_bucket"],
     count_columns=["edits"],
-    lookback_hours=SCOPE_HOURS,
 )
 ANOMALIES = GoldTable(
     "anomalies_hourly",
@@ -116,17 +116,58 @@ ANOMALIES = GoldTable(
      "is_anomaly", *TAIL],
     keys=[*WIKI_HOUR, "title"],
     count_columns=["edits_in_hour", "unique_editors"],
-    lookback_hours=1,
 )
 TABLES = [ACTIVITY, BOTS_VS_HUMANS, TRENDING, EDIT_SIZE, ANOMALIES]
 
 
-# ---------- helpers ----------
+# ---------- scope: which hours a run recomputes ----------
 
 def hours_back(hour, count):
-    """Partitions of hours H-(count-1) .. H, oldest first."""
-    return [get_partition(hour - timedelta(hours=back)) for back in reversed(range(count))]
+    """Hours H-(count-1) .. H, oldest first."""
+    return [hour - timedelta(hours=back) for back in reversed(range(count))]
 
+
+@dataclass(frozen=True)
+class Scope:
+    hours: List[datetime]           # aggregate tables are rewritten for these hours
+    anomaly_hours: List[datetime]   # anomalies_hourly is rewritten for these hours
+
+    def hours_of(self, table):
+        return self.anomaly_hours if table is ANOMALIES else self.hours
+
+    def partitions_of(self, table):
+        return [get_partition(h) for h in self.hours_of(table)]
+
+    def read_partitions(self):
+        """Silver partitions needed: the hours themselves + the 24 h baseline of every anomaly hour."""
+        needed = set(self.hours)
+        for hour in self.anomaly_hours:
+            needed.update(hours_back(hour, BASELINE_HOURS + 1))
+        return [get_partition(h) for h in sorted(needed)]
+
+    def label(self):
+        return ",".join(f"{h:%Y-%m-%dT%H}" for h in self.hours)
+
+
+def backfill_scope(hour):
+    """H and H-1 for the aggregates (late events), only H for anomalies."""
+    return Scope(hours=hours_back(hour, 2), anomaly_hours=[hour])
+
+
+def stream_scope(hours):
+    """A micro-batch recomputes every table for the hours its new silver rows belong to."""
+    return Scope(hours=sorted(hours), anomaly_hours=sorted(hours))
+
+
+def partition_hour(row):
+    return datetime(int(row["year"]), int(row["month"]), int(row["day"]), int(row["hour"]), tzinfo=timezone.utc)
+
+
+def affected_hours(micro_batch):
+    return [partition_hour(row) for row in micro_batch.select(*PARTITIONS).distinct().collect()]
+
+
+# ---------- helpers ----------
 
 def is_type(*types):
     return F.col("type").isin(*types)
@@ -150,6 +191,10 @@ def finish(df, table, processed_at):
 
 def with_hour_ts(silver):
     return silver.withColumn("hour_ts", F.date_trunc("hour", "event_ts"))
+
+
+def in_hours(hours):
+    return F.col("hour_ts").isin(*[F.lit(h) for h in hours])
 
 
 # ---------- tables ----------
@@ -218,21 +263,27 @@ def edit_size_hourly(silver, processed_at):
     return finish(df.withColumn("pct_of_wiki_edits", share_of_wiki_hour("edits")), EDIT_SIZE, processed_at)
 
 
-def score_pages(window, hour):
-    """Every page edited in H with its baseline and z-score (before keeping only the anomalies).
-    window: silver rows of H-24 .. H. Baseline = edits per hour of the same page (wiki + title) in H-24 .. H-1,
-    divided by 24 so hours without edits count as 0; stddev is the population stddev over those 24 values."""
+def score_pages(window, hours):
+    """Every page edited in one of `hours`, with its baseline and z-score (before keeping only the anomalies).
+    window: silver rows covering each hour H and its H-24 .. H-1. Baseline = edits per hour of the same page
+    (wiki + title) in H-24 .. H-1, divided by 24 so hours without edits count as 0; stddev is the population
+    stddev over those 24 values. All hours are scored in one pass (a range join on the page's hourly counts)."""
     edits = with_hour_ts(window).filter(is_type(*EDIT_TYPES))
-    page = ["wiki", "title"]
-    current = edits.filter(F.col("hour_ts") == F.lit(hour)).groupBy(*GROUP_KEYS, "title").agg(
+    current = edits.filter(in_hours(hours)).groupBy(*GROUP_KEYS, "title").agg(
         F.count(F.lit(1)).alias("edits_in_hour"),
         F.countDistinct("user").alias("unique_editors"),
     )
-    baseline_start = hour - timedelta(hours=BASELINE_HOURS)
-    per_hour = (edits.filter((F.col("hour_ts") >= F.lit(baseline_start)) & (F.col("hour_ts") < F.lit(hour)))
-                     .groupBy(*page, "hour_ts").agg(F.count(F.lit(1)).alias("n")))
-    baseline = per_hour.groupBy(*page).agg(F.sum("n").alias("_sum"), F.sum(F.col("n") * F.col("n")).alias("_sum_sq"))
-    scored = current.join(baseline, page, "left").fillna(0, subset=["_sum", "_sum_sq"])
+    history = (edits.groupBy("wiki", "title", "hour_ts").agg(F.count(F.lit(1)).alias("n"))
+                    .select(F.col("wiki").alias("_wiki"), F.col("title").alias("_title"),
+                            F.col("hour_ts").alias("_hour"), "n"))
+    in_baseline = ((F.col("_wiki") == F.col("wiki")) & (F.col("_title") == F.col("title"))
+                   & (F.col("_hour") >= F.col("hour_ts") - F.expr(f"INTERVAL {BASELINE_HOURS} HOURS"))
+                   & (F.col("_hour") < F.col("hour_ts")))
+    baseline = (current.select("wiki", "title", "hour_ts").join(history, in_baseline, "left")
+                       .groupBy("wiki", "title", "hour_ts")
+                       .agg(F.coalesce(F.sum("n"), F.lit(0)).alias("_sum"),
+                            F.coalesce(F.sum(F.col("n") * F.col("n")), F.lit(0)).alias("_sum_sq")))
+    scored = current.join(baseline, ["wiki", "title", "hour_ts"], "left").fillna(0, subset=["_sum", "_sum_sq"])
     avg = F.col("_sum") / F.lit(BASELINE_HOURS)
     variance = F.col("_sum_sq") / F.lit(BASELINE_HOURS) - avg * avg
     scored = (scored.withColumn("baseline_avg_edits", avg)
@@ -243,19 +294,24 @@ def score_pages(window, hour):
                              & (F.col("edits_in_hour") >= MIN_EDITS_FOR_ANOMALY))
 
 
-def anomalies_hourly(window, hour, processed_at):
-    return finish(score_pages(window, hour).filter(F.col("is_anomaly")), ANOMALIES, processed_at)
+def anomalies_hourly(window, hours, processed_at):
+    return finish(score_pages(window, hours).filter(F.col("is_anomaly")), ANOMALIES, processed_at)
 
 
-def build_tables(window, hour, processed_at):
-    """{GoldTable: DataFrame}. window = silver H-24 .. H; every table but anomalies uses only H-1 .. H."""
-    scope = window.where(partition_predicate(hours_back(hour, SCOPE_HOURS)))
+def scope_rows(window, scope):
+    """Silver rows of the hours whose aggregates are recomputed."""
+    return window.where(partition_predicate([get_partition(h) for h in scope.hours]))
+
+
+def build_tables(window, scope, processed_at):
+    """{GoldTable: DataFrame}. window = silver rows of scope.read_partitions()."""
+    silver = scope_rows(window, scope)
     return {
-        ACTIVITY: activity_hourly(scope, processed_at),
-        BOTS_VS_HUMANS: bots_vs_humans_hourly(scope, processed_at),
-        TRENDING: trending_pages_hourly(scope, processed_at),
-        EDIT_SIZE: edit_size_hourly(scope, processed_at),
-        ANOMALIES: anomalies_hourly(window, hour, processed_at),
+        ACTIVITY: activity_hourly(silver, processed_at),
+        BOTS_VS_HUMANS: bots_vs_humans_hourly(silver, processed_at),
+        TRENDING: trending_pages_hourly(silver, processed_at),
+        EDIT_SIZE: edit_size_hourly(silver, processed_at),
+        ANOMALIES: anomalies_hourly(window, scope.anomaly_hours, processed_at),
     }
 
 
@@ -272,62 +328,102 @@ def table_checks(table, df):
     return checks
 
 
-def totals_match_silver(activity, scope):
+def totals_match_silver(activity, silver):
     """sum(total_events) per hour in activity_hourly == silver rows per hour."""
     actual = activity.groupBy(*PARTITIONS).agg(F.sum("total_events").alias("value"))
-    expected = scope.groupBy(*PARTITIONS).agg(F.count(F.lit(1)).alias("value"))
+    expected = silver.groupBy(*PARTITIONS).agg(F.count(F.lit(1)).alias("value"))
     return quality.counts_match("total_events_match_silver", actual, expected, PARTITIONS)
 
 
-def run_quality(tables, scope):
+def run_quality(tables, silver):
+    """silver: the silver rows of the recomputed hours (scope_rows)."""
     results = []
     for table, df in tables.items():
         checks = table_checks(table, df)
         if table is ACTIVITY:
-            checks.append(totals_match_silver(df, scope))
+            checks.append(totals_match_silver(df, silver))
         results += quality.prefixed(quality.run_checks(df, checks), table.name)
     return results
 
 
 # ---------- read / write ----------
 
-def read_silver(spark, hour):
-    """Silver partitions H-24 .. H only (the anomaly baseline is the widest window)."""
+def read_silver(spark, scope):
+    """Only the silver partitions the scope needs (never the whole table)."""
     return (spark.table(config.SILVER_TABLE)
-            .where(partition_predicate(hours_back(hour, BASELINE_HOURS + 1)))
+            .where(partition_predicate(scope.read_partitions()))
             .select(*SILVER_FIELDS))
 
 
-def write_table(table, df, hour):
-    """Replaces exactly the run's partitions of the table (also when df is empty)."""
-    partitions = hours_back(hour, table.lookback_hours)
-    df.select(*table.columns).writeTo(table.table).overwrite(F.expr(partition_predicate(partitions)))
+def write_table(table, df, scope):
+    """Replaces exactly the scope's partitions of the table (also when df is empty)."""
+    df.select(*table.columns).writeTo(table.table).overwrite(F.expr(partition_predicate(scope.partitions_of(table))))
 
 
-# ---------- run ----------
+# ---------- batch ----------
 
-def run(spark, hour, metrics):
-    processed_at = utc_now()
-    window = read_silver(spark, hour).persist()
+def process(spark, scope, tag, metrics):
+    started = utc_now()
+    window = read_silver(spark, scope).persist()
     tables = {}
     try:
-        scope = window.where(partition_predicate(hours_back(hour, SCOPE_HOURS)))
-        tables = {table: df.persist() for table, df in build_tables(window, hour, processed_at).items()}
-        results = run_quality(tables, scope)
-        quality.log_results(results, JOB_NAME, f"{hour:%Y%m%d%H}")
+        tables = {table: df.persist() for table, df in build_tables(window, scope, started).items()}
+        results = run_quality(tables, scope_rows(window, scope))
+        quality.log_results(results, JOB_NAME, tag)
         for r in results:
             metrics.add(f"{METRIC}.checks_passed" if r.passed else f"{METRIC}.checks_failed", 1, check=r.name)
         quality.enforce(results)  # nothing has been written yet
+        written = {}
         for table, df in tables.items():
-            write_table(table, df, hour)
-            rows = df.count()
-            metrics.add(f"{METRIC}.rows_written", rows, table=table.name)
-            print(f"✔ {table.name}: {rows} rows written for {', '.join(p['hour'] + 'h' for p in hours_back(hour, table.lookback_hours))}")
+            write_table(table, df, scope)
+            written[table.name] = df.count()
+            metrics.add(f"{METRIC}.rows_written", written[table.name], table=table.name)
+        elapsed = int((utc_now() - started).total_seconds() * 1000)
+        metrics.record_ms(f"{METRIC}.batch_duration_ms", elapsed)
+        print(f"✔ Batch {tag}: hours {scope.label()} -> {written}, {elapsed} ms")
     finally:
         for df in tables.values():
             df.unpersist()
         window.unpersist()
 
+
+# ---------- modes ----------
+
+def read_silver_stream(spark):
+    """Only the partition columns: a micro-batch just tells which hours received new silver rows.
+    Silver is written with insert-only MERGE (= append snapshots)."""
+    return (spark.readStream.format("iceberg")
+            .option("streaming-skip-delete-snapshots", "true")
+            .option("streaming-skip-overwrite-snapshots", "true")
+            .option("streaming-max-files-per-micro-batch", config.SILVER_MAX_FILES_PER_TRIGGER)
+            .load(config.SILVER_TABLE)
+            .select(*PARTITIONS))
+
+
+def run_stream(spark, mode, metrics):
+    tables = [table.table for table in TABLES]
+
+    def handler(df, batch_id):
+        hours = affected_hours(df)
+        tag = stream_tag(spark, batch_id)
+        if hours:
+            process(spark, stream_scope(hours), tag, metrics)
+        else:
+            print(f"✔ Batch {tag}: no new rows")
+        maintain(spark, tables, batch_id)
+
+    query = (read_silver_stream(spark).writeStream.queryName(JOB_NAME).foreachBatch(handler)
+             .option("checkpointLocation", config.GOLD_CHECKPOINT_PATH)
+             .trigger(**stream_trigger(mode, config.GOLD_TRIGGER))
+             .start())
+    query.awaitTermination()
+
+
+def run_backfill(spark, hour, metrics):
+    process(spark, backfill_scope(hour), f"backfill-{hour:%Y%m%d%H}", metrics)
+
+
+# ---------- entry point ----------
 
 def check_output_contract(spark):
     """The tables must have exactly the columns this job writes, in order."""
@@ -348,17 +444,20 @@ def send_lineage():
 def main():
     args = parse_args()
     hour = run_hour(args)
-    print(f"✔ {JOB_NAME} starting: hour={hour:%Y-%m-%dT%H}:00Z (writes {hours_back(hour, SCOPE_HOURS)[0]['hour']}h-{hour:%H}h)")
+    print(f"✔ {JOB_NAME} starting: mode={args.mode}, hour={hour:%Y-%m-%dT%H}:00Z")
     spark = create_spark(JOB_NAME)
     log_versions(spark)
     run_migrations(spark, MIGRATIONS)
     check_output_contract(spark)
     maintain(spark, [table.table for table in TABLES])
-    metrics = Metrics("silver-to-gold", job=JOB_NAME, hour=f"{hour:%Y-%m-%dT%H}")
+    metrics = Metrics("silver-to-gold", job=JOB_NAME, mode=args.mode, hour=f"{hour:%Y-%m-%dT%H}")
     started = time.time()
     try:
-        send_lineage()
-        run(spark, hour, metrics)
+        send_lineage()  # sent at start: in continuous mode the job never reaches its end
+        if args.mode == "backfill":
+            run_backfill(spark, hour, metrics)
+        else:
+            run_stream(spark, args.mode, metrics)
         metrics.record_ms(f"{METRIC}.job_duration_ms", int((time.time() - started) * 1000))
     finally:
         metrics.close()  # force_flush: the process exits right after

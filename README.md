@@ -2,7 +2,12 @@
 
 ## Gold layer
 
-`silver_to_gold` builds hourly aggregates of `silver.recentchange` into five Iceberg tables in `lakehouse.gold`, partitioned by `year/month/day/hour`, where the hour is the event hour in UTC. Each run takes an hour H and rewrites hours H and H−1, so late events are absorbed. `anomalies_hourly` is the exception: it rewrites only H.
+`silver_to_gold` builds hourly aggregates of `silver.recentchange` into five Iceberg tables in `lakehouse.gold`, partitioned by `year/month/day/hour`, where the hour is the event hour in UTC.
+
+It runs in one of three modes, like the other jobs:
+- **`continuous`** (24/7): it reads silver as a stream. Every 5 minutes it recomputes, in full, the hours that received new silver rows, including any hour that gets late events. The open hour is provisional until its last events arrive.
+- **`backfill`**: it rewrites hours H and H−1, except for `anomalies_hourly`, which it rewrites only for H. Use it for history that the stream can no longer see, because silver keeps only 6 h of snapshots.
+- **`stream`**: it processes everything pending once and exits.
 
 | Table | One row per | Answers |
 |---|---|---|
@@ -14,8 +19,9 @@
 
 **`unique_editors` and `unique_pages` can't be summed.** They are `COUNT(DISTINCT)` values: the same editor or page can show up in several hours, wikis or editor types, so summing the rows counts it more than once. To get distinct counts over a longer period or across several wikis, recompute them from `silver.recentchange`. Every other count (`total_events`, `edits`, `net_bytes`, …) can be summed.
 
-Run the job a few minutes after the hour closes:
+Anomaly scores need 24 hours of silver data before the scored hour. During the first 24 hours of the history, the baseline is incomplete and the job flags more pages than it should.
 
 ```bash
-processing/scripts/submit_silver_to_gold.sh 2026 11 21 10   # at ~11:10 UTC
+processing/scripts/submit_silver_to_gold.sh $(date -u +"%Y %m %d %H") continuous   # 24/7
+processing/scripts/submit_silver_to_gold.sh 2026 11 21 10 backfill                  # rewrite 09h-10h
 ```

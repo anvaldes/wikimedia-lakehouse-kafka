@@ -12,7 +12,7 @@ Fixture tests/fixtures/silver_rows.jsonl (H = 2026-11-21T10Z):
 import json
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -52,12 +52,15 @@ def window(spark):
 
 @pytest.fixture(scope="module")
 def tables(window):
-    return {table.name: df.cache() for table, df in job.build_tables(window, H, PROCESSED_AT).items()}
+    """Backfill run for H: aggregates for H-1 and H, anomalies for H."""
+    built = job.build_tables(window, job.backfill_scope(H), PROCESSED_AT)
+    return {table.name: df.cache() for table, df in built.items()}
 
 
 @pytest.fixture(scope="module")
 def scope(window):
-    return window.where(job.partition_predicate(job.hours_back(H, job.SCOPE_HOURS)))
+    """Silver rows of the recomputed hours (what run_quality compares activity_hourly against)."""
+    return job.scope_rows(window, job.backfill_scope(H))
 
 
 def rows(df, **filters):
@@ -100,10 +103,26 @@ def test_unique_counts_are_documented_as_not_summable():
             assert "NOT summable" in line
 
 
-def test_scope_is_h_and_h_minus_one_and_baseline_is_24_hours():
-    assert [p["hour"] for p in job.hours_back(H, job.SCOPE_HOURS)] == ["09", "10"]
-    window = job.hours_back(H, job.BASELINE_HOURS + 1)
-    assert len(window) == 25 and window[0] == {"year": "2026", "month": "11", "day": "20", "hour": "10"}
+# ---------- scope ----------
+
+def test_backfill_scope_is_h_and_h_minus_one_with_anomalies_only_for_h():
+    scope = job.backfill_scope(H)
+    assert [p["hour"] for p in scope.partitions_of(job.ACTIVITY)] == ["09", "10"]
+    assert [p["hour"] for p in scope.partitions_of(job.ANOMALIES)] == ["10"]
+    reads = scope.read_partitions()                    # H-24 .. H: the anomaly baseline is the widest window
+    assert len(reads) == 25 and reads[0] == {"year": "2026", "month": "11", "day": "20", "hour": "10"}
+
+
+def test_stream_scope_recomputes_every_table_for_the_batch_hours():
+    late, current = H - timedelta(hours=5), H
+    scope = job.stream_scope([current, late])
+    assert scope.hours == scope.anomaly_hours == [late, current]
+    assert len(scope.read_partitions()) == 25 + 5      # union of both baselines, no duplicates
+
+
+def test_affected_hours_of_a_micro_batch(window):
+    micro_batch = window.filter("hour IN ('09', '10') AND day = '21'").select(*job.PARTITIONS)
+    assert sorted(job.affected_hours(micro_batch)) == [H - timedelta(hours=1), H]
 
 
 # ---------- activity_hourly ----------
@@ -189,8 +208,18 @@ def test_anomalies_flags_only_the_spike(tables):
     assert spike.z_score == pytest.approx((12 - avg) / std) and spike.is_anomaly
 
 
+def test_scoring_several_hours_at_once_matches_scoring_each_hour(window):
+    """Streaming scores all the batch's hours in one pass: H must score exactly as when scored alone."""
+    columns = ["wiki", "title", "edits_in_hour", "baseline_avg_edits", "baseline_stddev", "z_score", "is_anomaly"]
+    together = job.score_pages(window, [H - timedelta(hours=1), H]).filter("hour = '10'").select(*columns)
+    alone = job.score_pages(window, [H]).select(*columns)
+    assert sorted(together.collect()) == sorted(alone.collect())
+    earlier = {r.title: r for r in job.score_pages(window, [H - timedelta(hours=1)]).collect()}
+    assert not earlier["Steady page"].is_anomaly and "Spike page" not in earlier
+
+
 def test_steady_page_has_zero_stddev_and_is_not_an_anomaly(window):
-    scored = {(r.wiki, r.title): r for r in job.score_pages(window, H).collect()}
+    scored = {(r.wiki, r.title): r for r in job.score_pages(window, [H]).collect()}
     steady = scored[("enwiki", "Steady page")]
     assert (steady.baseline_avg_edits, steady.baseline_stddev, steady.z_score) == (10.0, 0.0, 0.0)
     assert not steady.is_anomaly
