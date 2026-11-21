@@ -1,4 +1,8 @@
 import json
+import os
+import re
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -25,8 +29,39 @@ BRONZE_SCHEMA = StructType([
 TIMESTAMPS = {"ingested_at", "timestamp_kafka", "timestamp_bronze"}
 
 
+# Spark 3.5 (= Dataproc runtime 2.2) runs on Java 8/11/17/21. From Java 23 on, Subject.getSubject() is
+# disabled and Hadoop fails with "UnsupportedOperationException: getSubject is not supported".
+SUPPORTED_JAVA = {8, 11, 17, 21}
+
+
+def java_major_version():
+    java_home = os.environ.get("JAVA_HOME")
+    java = str(Path(java_home) / "bin" / "java") if java_home else shutil.which("java")
+    try:
+        output = subprocess.run([java, "-version"], capture_output=True, text=True).stderr
+    except (OSError, TypeError):  # no java binary at all
+        return None
+    match = re.search(r'version "(\d+)(?:\.(\d+))?', output)
+    if not match:
+        return None
+    major = int(match.group(1))
+    return int(match.group(2)) if major == 1 else major  # "1.8.0_x" -> 8
+
+
+def require_supported_java():
+    version = java_major_version()
+    if version not in SUPPORTED_JAVA:
+        pytest.exit(
+            f"Spark 3.5 needs Java {sorted(SUPPORTED_JAVA)}, found: {version or 'none'}. "
+            "On macOS: brew install openjdk@17 && "
+            "export JAVA_HOME=$(brew --prefix openjdk@17)/libexec/openjdk.jdk/Contents/Home",
+            returncode=1,
+        )
+
+
 @pytest.fixture(scope="session")
 def spark():
+    require_supported_java()
     session = (SparkSession.builder.master("local[2]").appName("tests")
                .config("spark.sql.session.timeZone", "UTC")
                .config("spark.sql.shuffle.partitions", "2")

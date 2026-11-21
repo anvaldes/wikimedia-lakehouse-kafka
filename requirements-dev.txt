@@ -1,3 +1,4 @@
 # Unit tests (local Spark). Versions match the Dataproc Serverless runtime 2.2 (Spark 3.5).
+# Requires Java 17 (or 8/11/21): Spark 3.5 fails on Java 23+ with "getSubject is not supported".
 pyspark==3.5.1
 pytest==8.4.2
