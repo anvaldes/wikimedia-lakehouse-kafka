@@ -203,7 +203,7 @@ def stream_trigger(mode):
 
 def run_stream(spark, mode, metrics):
     handler = lambda df, batch_id: process_batch(df, stream_tag(spark, batch_id), metrics)
-    query = (read_stream(spark).writeStream.foreachBatch(handler)
+    query = (read_stream(spark).writeStream.queryName(JOB_NAME).foreachBatch(handler)
              .option("checkpointLocation", config.CHECKPOINT_PATH)
              .trigger(**stream_trigger(mode))
              .start())
